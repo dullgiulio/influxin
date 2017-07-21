@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"time"
 )
 
@@ -133,12 +134,59 @@ func (r *results) collect() {
 	}
 }
 
+func collect(cs []collector, stdout, stderr io.Reader) {
+	rs := newResults(cs)
+	go func() {
+		sc := bufio.NewScanner(stderr)
+		for sc.Scan() {
+			log.Printf("stderr: %s", sc.Text())
+		}
+		if err := sc.Err(); err != nil {
+			log.Fatal("error reading stderr: %s", err)
+		}
+	}()
+	go func() {
+		sc := bufio.NewScanner(stdout)
+		for sc.Scan() {
+			rs.ch <- sc.Text()
+		}
+		if err := sc.Err(); err != nil {
+			log.Fatal("error reading stdout: %s", err)
+		}
+		close(rs.ch)
+	}()
+	rs.collect()
+}
+
+func execCollect(cs []collector, cmdName string, cmdArgs []string) {
+	cmd := exec.Command(cmdName, cmdArgs...)
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		log.Fatalf("cannot get stderr for command: %s", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		log.Fatalf("cannot get stdout for command: %s", err)
+	}
+	if err := cmd.Start(); err != nil {
+		log.Fatalf("cannot start command: %s", err)
+	}
+	collect(cs, stdout, stderr)
+	if err := cmd.Wait(); err != nil {
+		log.Fatalf("error waiting for command: %s", err)
+	}
+}
+
 func main() {
 	verbose := flag.Bool("verbose", false, "Print measurements to stdout")
 	influxdb := flag.String("influxdb", defaultInfluxURL, "Address of InfluxDB write endpoint")
 	nbatch := flag.Int("influx-nbatch", 20, "Max number of measurements to cache")
 	tbatch := flag.Duration("influx-batch-time", 10*time.Second, "Max duration betweek flushes of InfluxDB cache")
 	flag.Parse()
+
+	args := flag.Args()
+	cmdName := args[0]
+	cmdArgs := args[1:len(args)]
 
 	var collectors []collector
 	if *influxdb != "" && *influxdb != defaultInfluxURL {
@@ -151,18 +199,7 @@ func main() {
 	if *verbose {
 		collectors = append(collectors, printCollector{os.Stdout})
 	}
-	results := newResults(collectors)
-
-	go func() {
-		sc := bufio.NewScanner(os.Stdin)
-		for sc.Scan() {
-			results.ch <- sc.Text()
-		}
-		if err := sc.Err(); err != nil {
-			log.Fatal("error reading input: %s", err)
-		}
-	}()
-
-	// TODO: on stdin EOF we should do graceful termination.
-	results.collect()
+	for {
+		execCollect(collectors, cmdName, cmdArgs)
+	}
 }
