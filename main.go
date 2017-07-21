@@ -83,7 +83,7 @@ func (b *batchCollector) flush() {
 	resp.Body.Close()
 }
 
-func ProxyAwareHttpClient() (*http.Client, error) {
+func proxyAwareHttpClient() (*http.Client, error) {
 	proxyurl, ok := os.LookupEnv("HTTP_PROXY")
 	if !ok {
 		return http.DefaultClient, nil
@@ -110,13 +110,11 @@ func (p printCollector) collect(ch <-chan string) {
 
 type results struct {
 	sinks []chan string
-	ch    chan string
 }
 
 func newResults(cols []collector) *results {
 	r := &results{
 		sinks: make([]chan string, len(cols)),
-		ch:    make(chan string),
 	}
 	for i := range cols {
 		ch := make(chan string)
@@ -126,16 +124,16 @@ func newResults(cols []collector) *results {
 	return r
 }
 
-func (r *results) collect() {
-	for res := range r.ch {
+func (r *results) collect(ch <-chan string) {
+	for res := range ch {
 		for i := range r.sinks {
 			r.sinks[i] <- res
 		}
 	}
 }
 
-func collect(cs []collector, stdout, stderr io.Reader) {
-	rs := newResults(cs)
+func drainPipes(rs *results, stdout, stderr io.Reader) {
+	ch := make(chan string)
 	go func() {
 		sc := bufio.NewScanner(stderr)
 		for sc.Scan() {
@@ -148,17 +146,17 @@ func collect(cs []collector, stdout, stderr io.Reader) {
 	go func() {
 		sc := bufio.NewScanner(stdout)
 		for sc.Scan() {
-			rs.ch <- sc.Text()
+			ch <- sc.Text()
 		}
 		if err := sc.Err(); err != nil {
 			log.Fatal("error reading stdout: %s", err)
 		}
-		close(rs.ch)
+		close(ch)
 	}()
-	rs.collect()
+	rs.collect(ch)
 }
 
-func execCollect(cs []collector, cmdName string, cmdArgs []string) {
+func execCollect(rs *results, cmdName string, cmdArgs []string) {
 	cmd := exec.Command(cmdName, cmdArgs...)
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
@@ -171,7 +169,7 @@ func execCollect(cs []collector, cmdName string, cmdArgs []string) {
 	if err := cmd.Start(); err != nil {
 		log.Fatalf("cannot start command: %s", err)
 	}
-	collect(cs, stdout, stderr)
+	drainPipes(rs, stdout, stderr)
 	if err := cmd.Wait(); err != nil {
 		log.Fatalf("error waiting for command: %s", err)
 	}
@@ -188,18 +186,19 @@ func main() {
 	cmdName := args[0]
 	cmdArgs := args[1:len(args)]
 
-	var collectors []collector
+	var cs []collector
 	if *influxdb != "" && *influxdb != defaultInfluxURL {
-		client, err := ProxyAwareHttpClient()
+		client, err := proxyAwareHttpClient()
 		if err != nil {
 			log.Fatalf("fatal: %s", err)
 		}
-		collectors = append(collectors, newBatchCollector(*influxdb, *nbatch, *tbatch, client))
+		cs = append(cs, newBatchCollector(*influxdb, *nbatch, *tbatch, client))
 	}
 	if *verbose {
-		collectors = append(collectors, printCollector{os.Stdout})
+		cs = append(cs, printCollector{os.Stdout})
 	}
+	rs := newResults(cs)
 	for {
-		execCollect(collectors, cmdName, cmdArgs)
+		execCollect(rs, cmdName, cmdArgs)
 	}
 }
