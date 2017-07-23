@@ -171,7 +171,7 @@ func execCollect(rs *results, cmdName string, cmdArgs []string) {
 	}
 	drainPipes(rs, stdout, stderr)
 	if err := cmd.Wait(); err != nil {
-		log.Fatalf("error waiting for command: %s", err)
+		log.Printf("error waiting for command: %s", err)
 	}
 }
 
