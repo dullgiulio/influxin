@@ -73,11 +73,11 @@ func (b *batchCollector) flush() {
 	b.batchi = 0
 	resp, err := b.client.Post(b.endpoint, "text/plain", &buf)
 	if err != nil {
-		log.Printf("influxdb: error posting data: %s", err)
+		log.Printf("influxin: error posting data: %s", err)
 		return
 	}
 	if resp.StatusCode != 204 {
-		log.Printf("influxdb: error posting data: expected status 204, got %s", resp.Status)
+		log.Printf("influxin: error posting data: expected status 204, got %s", resp.Status)
 	}
 	io.Copy(ioutil.Discard, resp.Body)
 	resp.Body.Close()
@@ -137,10 +137,10 @@ func drainPipes(rs *results, stdout, stderr io.Reader) {
 	go func() {
 		sc := bufio.NewScanner(stderr)
 		for sc.Scan() {
-			log.Printf("stderr: %s", sc.Text())
+			fmt.Println(sc.Text())
 		}
 		if err := sc.Err(); err != nil {
-			log.Fatal("error reading stderr: %s", err)
+			log.Fatal("influxin: error reading stderr: %s", err)
 		}
 	}()
 	go func() {
@@ -149,48 +149,109 @@ func drainPipes(rs *results, stdout, stderr io.Reader) {
 			ch <- sc.Text()
 		}
 		if err := sc.Err(); err != nil {
-			log.Fatal("error reading stdout: %s", err)
+			log.Fatal("influxin: error reading stdout: %s", err)
 		}
 		close(ch)
 	}()
 	rs.collect(ch)
 }
 
-func execCollect(rs *results, cmdName string, cmdArgs []string) {
-	cmd := exec.Command(cmdName, cmdArgs...)
+type cmd struct {
+	name string
+	args []string
+}
+
+func (c *cmd) execCollect(rs *results) {
+	cmd := exec.Command(c.name, c.args...)
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		log.Fatalf("cannot get stderr for command: %s", err)
+		log.Fatalf("influxin: cannot get stderr for command: %s", err)
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		log.Fatalf("cannot get stdout for command: %s", err)
+		log.Fatalf("influxin: cannot get stdout for command: %s", err)
 	}
 	if err := cmd.Start(); err != nil {
-		log.Fatalf("cannot start command: %s", err)
+		log.Fatalf("influxin: cannot start command: %s", err)
 	}
 	drainPipes(rs, stdout, stderr)
 	if err := cmd.Wait(); err != nil {
-		log.Printf("error waiting for command: %s", err)
+		if _, ok := err.(*exec.ExitError); ok {
+			log.Fatalf("influxin: child exited with failure code, aborting (%s)", err)
+		}
+		log.Printf("influxin: error waiting for command: %s", err)
 	}
+}
+
+func (c cmd) equal(d cmd) bool {
+	if c.name != d.name || len(c.args) != len(d.args) {
+		return false
+	}
+	for i := range c.args {
+		if c.args[i] != d.args[i] {
+			return false
+		}
+	}
+	return true
+}
+
+type cmds []cmd
+
+func cmdsFromArgs(args []string) cmds {
+	cmds := cmds(make([]cmd, 0))
+	c := cmd{}
+	for i := range args {
+		if c.name == "" {
+			c.name = args[i]
+			continue
+		}
+		if args[i] == ";" {
+			cmds = append(cmds, c)
+			c = cmd{}
+			continue
+		}
+		c.args = append(c.args, args[i])
+	}
+	if c.name != "" {
+		cmds = append(cmds, c)
+	}
+	return cmds
+}
+
+func (c cmds) run(rs *results) {
+	for i := range c {
+		go func() {
+			for {
+				c[i].execCollect(rs)
+			}
+		}()
+	}
+	select {}
+}
+
+func (c cmds) has(cmd cmd) bool {
+	for i := range c {
+		if c[i].equal(cmd) {
+			return true
+		}
+	}
+	return false
 }
 
 func main() {
 	verbose := flag.Bool("verbose", false, "Print measurements to stdout")
 	influxdb := flag.String("influxdb", defaultInfluxURL, "Address of InfluxDB write endpoint")
-	nbatch := flag.Int("influx-nbatch", 20, "Max number of measurements to cache")
-	tbatch := flag.Duration("influx-batch-time", 10*time.Second, "Max duration betweek flushes of InfluxDB cache")
+	nbatch := flag.Int("influx-nbatch", 100, "Max number of measurements to cache")
+	tbatch := flag.Duration("influx-batch-time", 1*time.Minute, "Max duration betweek flushes of InfluxDB cache")
 	flag.Parse()
 
-	args := flag.Args()
-	cmdName := args[0]
-	cmdArgs := args[1:len(args)]
+	cmds := cmdsFromArgs(flag.Args())
 
 	var cs []collector
 	if *influxdb != "" && *influxdb != defaultInfluxURL {
 		client, err := proxyAwareHttpClient()
 		if err != nil {
-			log.Fatalf("fatal: %s", err)
+			log.Fatalf("influxin: fatal: %s", err)
 		}
 		cs = append(cs, newBatchCollector(*influxdb, *nbatch, *tbatch, client))
 	}
@@ -198,7 +259,5 @@ func main() {
 		cs = append(cs, printCollector{os.Stdout})
 	}
 	rs := newResults(cs)
-	for {
-		execCollect(rs, cmdName, cmdArgs)
-	}
+	cmds.run(rs)
 }
