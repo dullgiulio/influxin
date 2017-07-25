@@ -220,11 +220,11 @@ func cmdsFromArgs(args []string) cmds {
 
 func (c cmds) run(rs *results) {
 	for i := range c {
-		go func() {
+		go func(c *cmd) {
 			for {
-				c[i].execCollect(rs)
+				c.execCollect(rs)
 			}
-		}()
+		}(&c[i])
 	}
 	select {}
 }
