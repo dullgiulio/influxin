@@ -83,7 +83,7 @@ func (b *batchCollector) flush() {
 	resp.Body.Close()
 }
 
-func proxyAwareHttpClient() (*http.Client, error) {
+func proxyAwareHTTPClient() (*http.Client, error) {
 	proxyurl, ok := os.LookupEnv("HTTP_PROXY")
 	if !ok {
 		return http.DefaultClient, nil
@@ -249,7 +249,7 @@ func main() {
 
 	var cs []collector
 	if *influxdb != "" && *influxdb != defaultInfluxURL {
-		client, err := proxyAwareHttpClient()
+		client, err := proxyAwareHTTPClient()
 		if err != nil {
 			log.Fatalf("influxin: fatal: %s", err)
 		}
