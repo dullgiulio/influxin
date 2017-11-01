@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -112,7 +113,10 @@ type results struct {
 	sinks []chan string
 }
 
-func newResults(cols []collector) *results {
+func newResults(cols []collector) (*results, error) {
+	if len(cols) == 0 {
+		return nil, errors.New("no collectors specified")
+	}
 	r := &results{
 		sinks: make([]chan string, len(cols)),
 	}
@@ -121,7 +125,7 @@ func newResults(cols []collector) *results {
 		r.sinks[i] = ch
 		go cols[i].collect(ch)
 	}
-	return r
+	return r, nil
 }
 
 func (r *results) collect(ch <-chan string) {
@@ -224,6 +228,10 @@ func configure() (cmds, *results, error) {
 	tbatch := flag.Duration("influx-batch-time", 1*time.Minute, "Max duration betweek flushes of InfluxDB cache")
 	flag.Parse()
 
+	cmds := cmdsFromArgs(flag.Args())
+	if len(cmds) == 0 {
+		return nil, nil, errors.New("specify one or more commands to execute, separated by semicolon")
+	}
 	var cs []collector
 	if *influxdb != "" && *influxdb != defaultInfluxURL {
 		client, err := proxyAwareHTTPClient()
@@ -235,16 +243,17 @@ func configure() (cmds, *results, error) {
 	if *verbose {
 		cs = append(cs, printCollector{os.Stdout})
 	}
-	return cmdsFromArgs(flag.Args()), newResults(cs), nil
+	rs, err := newResults(cs)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%v: use either -influxdb or -verbose", err)
+	}
+	return cmdsFromArgs(flag.Args()), rs, nil
 }
 
 func main() {
 	cmds, rs, err := configure()
 	if err != nil {
 		log.Fatalf("influxin: fatal: %v", err)
-	}
-	if len(cmds) == 0 {
-		log.Fatalf("influxin: fatal: specify one or more commands to execute, separated by semicolon")
 	}
 	cmds.run(rs)
 }
