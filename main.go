@@ -20,6 +20,11 @@ const (
 	defaultInfluxURL = "http://HOST:8086/write?db=MY_DB"
 )
 
+var (
+	elog *log.Logger
+	flog *log.Logger
+)
+
 type collector interface {
 	collect(<-chan string)
 }
@@ -60,12 +65,14 @@ func (b *batchCollector) collect(ch <-chan string) {
 				skipTick = false
 				continue
 			}
-			b.flush()
+			if err := b.flush(); err != nil {
+				elog.Printf("flushing data: %v", err)
+			}
 		}
 	}
 }
 
-func (b *batchCollector) flush() {
+func (b *batchCollector) flush() error {
 	var buf bytes.Buffer
 	for i := 0; i < b.batchi; i++ {
 		fmt.Fprintln(&buf, b.batch[i])
@@ -74,14 +81,16 @@ func (b *batchCollector) flush() {
 	b.batchi = 0
 	resp, err := b.client.Post(b.endpoint, "text/plain", &buf)
 	if err != nil {
-		log.Printf("influxin: error posting data: %s", err)
-		return
+		return fmt.Errorf("cannot POST data: %v", err)
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode != 204 {
-		log.Printf("influxin: error posting data: expected status 204, got %s", resp.Status)
+		return fmt.Errorf("expected status 204, got %s", resp.Status)
 	}
-	io.Copy(ioutil.Discard, resp.Body)
-	resp.Body.Close()
+	if _, err := io.Copy(ioutil.Discard, resp.Body); err != nil {
+		return fmt.Errorf("cannot read and discard data: %v", err)
+	}
+	return nil
 }
 
 func proxyAwareHTTPClient() (*http.Client, error) {
@@ -144,7 +153,7 @@ func drainPipes(rs *results, stdout, stderr io.Reader) {
 			fmt.Println(sc.Text())
 		}
 		if err := sc.Err(); err != nil {
-			log.Printf("influxin: error reading stderr: %v", err)
+			elog.Printf("reading stderr: %v", err)
 		}
 	}()
 	go func() {
@@ -153,7 +162,7 @@ func drainPipes(rs *results, stdout, stderr io.Reader) {
 			ch <- sc.Text()
 		}
 		if err := sc.Err(); err != nil {
-			log.Fatalf("influxin: error reading stdout: %v", err)
+			flog.Fatalf("fatal: reading stdout: %v", err)
 		}
 		close(ch)
 	}()
@@ -165,26 +174,27 @@ type cmd struct {
 	args []string
 }
 
-func (c *cmd) execCollect(rs *results) {
+func (c *cmd) execCollect(rs *results) error {
 	cmd := exec.Command(c.name, c.args...)
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		log.Fatalf("influxin: cannot get stderr for command: %s", err)
+		return fmt.Errorf("cannot get stderr for command: %v", err)
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		log.Fatalf("influxin: cannot get stdout for command: %s", err)
+		return fmt.Errorf("fatal: cannot get stdout for command: %v", err)
 	}
 	if err := cmd.Start(); err != nil {
-		log.Fatalf("influxin: cannot start command: %s", err)
+		return fmt.Errorf("fatal: cannot start command: %v", err)
 	}
 	drainPipes(rs, stdout, stderr)
 	if err := cmd.Wait(); err != nil {
 		if _, ok := err.(*exec.ExitError); ok {
-			log.Fatalf("influxin: child exited with failure code, aborting (%s)", err)
+			return fmt.Errorf("child exited with failure code, aborting (%v)", err)
 		}
-		log.Printf("influxin: error waiting for command: %s", err)
+		elog.Printf("error waiting for command: %v", err)
 	}
+	return nil
 }
 
 type cmds []cmd
@@ -211,12 +221,15 @@ func cmdsFromArgs(args []string) cmds {
 }
 
 func (c cmds) run(rs *results) {
-	for i := range c {
-		go func(c *cmd) {
-			for {
-				c.execCollect(rs)
+	runOne := func(c *cmd) {
+		for {
+			if err := c.execCollect(rs); err != nil {
+				flog.Fatalf("executing subprocess: %v", err)
 			}
-		}(&c[i])
+		}
+	}
+	for i := range c {
+		go runOne(&c[i])
 	}
 	select {}
 }
@@ -251,9 +264,11 @@ func configure() (cmds, *results, error) {
 }
 
 func main() {
+	elog = log.New(os.Stderr, "error - ", log.LstdFlags)
+	flog = log.New(os.Stderr, "fatal - ", log.LstdFlags)
 	cmds, rs, err := configure()
 	if err != nil {
-		log.Fatalf("influxin: fatal: %v", err)
+		flog.Fatalf("configuration error: %v", err)
 	}
 	cmds.run(rs)
 }
