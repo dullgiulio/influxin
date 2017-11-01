@@ -140,7 +140,7 @@ func drainPipes(rs *results, stdout, stderr io.Reader) {
 			fmt.Println(sc.Text())
 		}
 		if err := sc.Err(); err != nil {
-			log.Fatal("influxin: error reading stderr: %s", err)
+			log.Printf("influxin: error reading stderr: %v", err)
 		}
 	}()
 	go func() {
@@ -149,7 +149,7 @@ func drainPipes(rs *results, stdout, stderr io.Reader) {
 			ch <- sc.Text()
 		}
 		if err := sc.Err(); err != nil {
-			log.Fatal("influxin: error reading stdout: %s", err)
+			log.Fatalf("influxin: error reading stdout: %v", err)
 		}
 		close(ch)
 	}()
@@ -181,18 +181,6 @@ func (c *cmd) execCollect(rs *results) {
 		}
 		log.Printf("influxin: error waiting for command: %s", err)
 	}
-}
-
-func (c cmd) equal(d cmd) bool {
-	if c.name != d.name || len(c.args) != len(d.args) {
-		return false
-	}
-	for i := range c.args {
-		if c.args[i] != d.args[i] {
-			return false
-		}
-	}
-	return true
 }
 
 type cmds []cmd
@@ -229,35 +217,34 @@ func (c cmds) run(rs *results) {
 	select {}
 }
 
-func (c cmds) has(cmd cmd) bool {
-	for i := range c {
-		if c[i].equal(cmd) {
-			return true
-		}
-	}
-	return false
-}
-
-func main() {
+func configure() (cmds, *results, error) {
 	verbose := flag.Bool("verbose", false, "Print measurements to stdout")
 	influxdb := flag.String("influxdb", defaultInfluxURL, "Address of InfluxDB write endpoint")
 	nbatch := flag.Int("influx-nbatch", 100, "Max number of measurements to cache")
 	tbatch := flag.Duration("influx-batch-time", 1*time.Minute, "Max duration betweek flushes of InfluxDB cache")
 	flag.Parse()
 
-	cmds := cmdsFromArgs(flag.Args())
-
 	var cs []collector
 	if *influxdb != "" && *influxdb != defaultInfluxURL {
 		client, err := proxyAwareHTTPClient()
 		if err != nil {
-			log.Fatalf("influxin: fatal: %s", err)
+			return nil, nil, err
 		}
 		cs = append(cs, newBatchCollector(*influxdb, *nbatch, *tbatch, client))
 	}
 	if *verbose {
 		cs = append(cs, printCollector{os.Stdout})
 	}
-	rs := newResults(cs)
+	return cmdsFromArgs(flag.Args()), newResults(cs), nil
+}
+
+func main() {
+	cmds, rs, err := configure()
+	if err != nil {
+		log.Fatalf("influxin: fatal: %v", err)
+	}
+	if len(cmds) == 0 {
+		log.Fatalf("influxin: fatal: specify one or more commands to execute, separated by semicolon")
+	}
 	cmds.run(rs)
 }
