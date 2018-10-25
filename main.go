@@ -65,6 +65,9 @@ func (b *batchCollector) collect(ch <-chan string) {
 				skipTick = false
 				continue
 			}
+			if b.batchi == 0 {
+				continue
+			}
 			if err := b.flush(); err != nil {
 				elog.Printf("flushing data: %v", err)
 			}
@@ -84,8 +87,8 @@ func (b *batchCollector) flush() error {
 		return fmt.Errorf("cannot POST data: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 204 {
-		return fmt.Errorf("expected status 204, got %s", resp.Status)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("expected status 2xx, got %s", resp.Status)
 	}
 	if _, err := io.Copy(ioutil.Discard, resp.Body); err != nil {
 		return fmt.Errorf("cannot read and discard data: %v", err)
@@ -236,9 +239,9 @@ func (c cmds) run(rs *results) {
 
 func configure() (cmds, *results, error) {
 	verbose := flag.Bool("verbose", false, "Print measurements to stdout")
-	influxdb := flag.String("influxdb", defaultInfluxURL, "Address of InfluxDB write endpoint")
-	nbatch := flag.Int("influx-nbatch", 100, "Max number of measurements to cache")
-	tbatch := flag.Duration("influx-batch-time", 1*time.Minute, "Max duration betweek flushes of InfluxDB cache")
+	influxdb := flag.String("endpoint", defaultInfluxURL, "Address of InfluxDB write endpoint")
+	nbatch := flag.Int("nbatch", 100, "Max number of measurements to cache")
+	tbatch := flag.Duration("batch-time", 1*time.Minute, "Max duration betweek flushes of InfluxDB cache")
 	flag.Parse()
 
 	cmds := cmdsFromArgs(flag.Args())
