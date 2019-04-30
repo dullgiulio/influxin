@@ -10,14 +10,13 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"time"
 )
 
 const (
-	defaultInfluxURL = "http://HOST:8086/write?db=MY_DB"
+	defaultInfluxURL = "http://USER:PASS@HOST:8086/write?db=MY_DB"
 )
 
 var (
@@ -25,26 +24,69 @@ var (
 	flog *log.Logger
 )
 
+type submitter struct {
+	ch       chan io.Reader
+	endpoint string
+	client   *http.Client
+}
+
+func newSubmitter(nworkers, nbuf int, endpoint string, client *http.Client) *submitter {
+	s := &submitter{
+		ch:       make(chan io.Reader, nbuf),
+		client:   client,
+		endpoint: endpoint,
+	}
+	for i := 0; i < nworkers; i++ {
+		go s.run()
+	}
+	return s
+}
+
+func (s *submitter) run() {
+	for r := range s.ch {
+		if err := s.send(r); err != nil {
+			elog.Printf("could not submit batch: %v", err)
+		}
+	}
+}
+
+func (s *submitter) submit(r io.Reader) {
+	s.ch <- r
+}
+
+func (s *submitter) send(r io.Reader) error {
+	resp, err := s.client.Post(s.endpoint, "text/plain", r)
+	if err != nil {
+		return fmt.Errorf("cannot POST data: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("expected status 2xx, got %s", resp.Status)
+	}
+	if _, err := io.Copy(ioutil.Discard, resp.Body); err != nil {
+		return fmt.Errorf("cannot read and discard data: %v", err)
+	}
+	return nil
+}
+
 type collector interface {
 	collect(<-chan string)
 }
 
 type batchCollector struct {
-	endpoint string
-	nbatch   int
-	batchi   int // current position in batch slice
-	tbatch   time.Duration
-	batch    []string
-	client   *http.Client
+	nbatch    int
+	batchi    int // current position in batch slice
+	tbatch    time.Duration
+	submitter *submitter
+	batch     []string
 }
 
-func newBatchCollector(endp string, nbatch int, tbatch time.Duration, client *http.Client) *batchCollector {
+func newBatchCollector(nbatch int, tbatch time.Duration, sub *submitter) *batchCollector {
 	return &batchCollector{
-		endpoint: endp,
-		nbatch:   nbatch,
-		tbatch:   tbatch,
-		client:   client,
-		batch:    make([]string, nbatch),
+		nbatch:    nbatch,
+		tbatch:    tbatch,
+		submitter: sub,
+		batch:     make([]string, nbatch),
 	}
 }
 
@@ -68,47 +110,29 @@ func (b *batchCollector) collect(ch <-chan string) {
 			if b.batchi == 0 {
 				continue
 			}
-			if err := b.flush(); err != nil {
-				elog.Printf("flushing data: %v", err)
-			}
+			b.flush()
 		}
 	}
 }
 
-func (b *batchCollector) flush() error {
+func (b *batchCollector) flush() {
 	var buf bytes.Buffer
+	if err := b.writeTo(&buf); err != nil {
+		elog.Printf("flushing data: cannot write to buffer: %v", err)
+		return
+	}
+	b.submitter.submit(&buf)
+}
+
+func (b *batchCollector) writeTo(w io.Writer) error {
 	for i := 0; i < b.batchi; i++ {
-		fmt.Fprintln(&buf, b.batch[i])
+		if _, err := fmt.Fprintln(w, b.batch[i]); err != nil {
+			return fmt.Errorf("cannot write batch line: %v", err)
+		}
 		b.batch[i] = ""
 	}
 	b.batchi = 0
-	resp, err := b.client.Post(b.endpoint, "text/plain", &buf)
-	if err != nil {
-		return fmt.Errorf("cannot POST data: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("expected status 2xx, got %s", resp.Status)
-	}
-	if _, err := io.Copy(ioutil.Discard, resp.Body); err != nil {
-		return fmt.Errorf("cannot read and discard data: %v", err)
-	}
 	return nil
-}
-
-func proxyAwareHTTPClient() (*http.Client, error) {
-	proxyurl, ok := os.LookupEnv("HTTP_PROXY")
-	if !ok {
-		return http.DefaultClient, nil
-	}
-	purl, err := url.Parse(proxyurl)
-	if err != nil {
-		return nil, fmt.Errorf("invalid URL in environment variable HTTP_PROXY: %s", err)
-	}
-	tr := &http.Transport{
-		Proxy: http.ProxyURL(purl),
-	}
-	return &http.Client{Transport: tr}, nil
 }
 
 type printCollector struct {
@@ -242,26 +266,26 @@ func configure() (cmds, *results, error) {
 	influxdb := flag.String("endpoint", defaultInfluxURL, "Address of InfluxDB write endpoint")
 	nbatch := flag.Int("nbatch", 100, "Max number of measurements to cache")
 	tbatch := flag.Duration("batch-time", 1*time.Minute, "Max duration betweek flushes of InfluxDB cache")
+	nworkers := 1 // number of HTTP submitting workers
+	nbuf := 0     // buffer for workers channel
 	flag.Parse()
 
 	cmds := cmdsFromArgs(flag.Args())
 	if len(cmds) == 0 {
 		return nil, nil, errors.New("specify one or more commands to execute, separated by semicolon")
 	}
+	client := &http.Client{}
+	submitter := newSubmitter(nworkers, nbuf, *influxdb, client)
 	var cs []collector
 	if *influxdb != "" && *influxdb != defaultInfluxURL {
-		client, err := proxyAwareHTTPClient()
-		if err != nil {
-			return nil, nil, err
-		}
-		cs = append(cs, newBatchCollector(*influxdb, *nbatch, *tbatch, client))
+		cs = append(cs, newBatchCollector(*nbatch, *tbatch, submitter))
 	}
 	if *verbose {
 		cs = append(cs, printCollector{os.Stdout})
 	}
 	rs, err := newResults(cs)
 	if err != nil {
-		return nil, nil, fmt.Errorf("%v: use either -influxdb or -verbose", err)
+		return nil, nil, fmt.Errorf("%v: use either -endpoint or -verbose", err)
 	}
 	return cmdsFromArgs(flag.Args()), rs, nil
 }
