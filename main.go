@@ -10,6 +10,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"net/http/httputil"
 	"os"
 	"os/exec"
 	"time"
@@ -21,20 +22,23 @@ const (
 
 var (
 	elog *log.Logger
+	dlog *log.Logger
 	flog *log.Logger
 )
 
 type submitter struct {
 	ch       chan io.Reader
 	endpoint string
+	debug    bool
 	client   *http.Client
 }
 
-func newSubmitter(nworkers, nbuf int, endpoint string, client *http.Client) *submitter {
+func newSubmitter(nworkers, nbuf int, endpoint string, client *http.Client, debug bool) *submitter {
 	s := &submitter{
 		ch:       make(chan io.Reader, nbuf),
 		client:   client,
 		endpoint: endpoint,
+		debug:    debug,
 	}
 	for i := 0; i < nworkers; i++ {
 		go s.run()
@@ -55,12 +59,33 @@ func (s *submitter) submit(r io.Reader) {
 }
 
 func (s *submitter) send(r io.Reader) error {
-	resp, err := s.client.Post(s.endpoint, "text/plain", r)
+	var debugBuf []byte
+	req, err := http.NewRequest("POST", s.endpoint, r)
+	if err != nil {
+		return fmt.Errorf("cannot create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "text/plain")
+	if s.debug {
+		debugBuf, err = httputil.DumpRequest(req, true)
+		if err != nil {
+			elog.Printf("could not dump POST request for debugging: %v", err)
+		}
+	}
+	resp, err := s.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("cannot POST data: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if s.debug {
+			dlog.Printf("failed POST request:\n\n%s\n", debugBuf)
+			debugBuf, err = httputil.DumpResponse(resp, true)
+			if err != nil {
+				elog.Printf("could not dump influx reponse for debugging: %v", err)
+			} else {
+				dlog.Printf("failed POST reponse:\n\n%s\n\n", debugBuf)
+			}
+		}
 		return fmt.Errorf("expected status 2xx, got %s", resp.Status)
 	}
 	if _, err := io.Copy(ioutil.Discard, resp.Body); err != nil {
@@ -263,6 +288,7 @@ func (c cmds) run(rs *results) {
 
 func configure() (cmds, *results, error) {
 	verbose := flag.Bool("verbose", false, "Print measurements to stdout")
+	debug := flag.Bool("debug", false, "Print failed requests to stdout")
 	influxdb := flag.String("endpoint", defaultInfluxURL, "Address of InfluxDB write endpoint")
 	nbatch := flag.Int("nbatch", 100, "Max number of measurements to cache")
 	tbatch := flag.Duration("batch-time", 1*time.Minute, "Max duration betweek flushes of InfluxDB cache")
@@ -275,7 +301,7 @@ func configure() (cmds, *results, error) {
 		return nil, nil, errors.New("specify one or more commands to execute, separated by semicolon")
 	}
 	client := &http.Client{}
-	submitter := newSubmitter(nworkers, nbuf, *influxdb, client)
+	submitter := newSubmitter(nworkers, nbuf, *influxdb, client, *debug)
 	var cs []collector
 	if *influxdb != "" && *influxdb != defaultInfluxURL {
 		cs = append(cs, newBatchCollector(*nbatch, *tbatch, submitter))
@@ -292,6 +318,7 @@ func configure() (cmds, *results, error) {
 
 func main() {
 	elog = log.New(os.Stderr, "error - ", log.LstdFlags)
+	dlog = log.New(os.Stdout, "debug - ", log.LstdFlags)
 	flog = log.New(os.Stderr, "fatal - ", log.LstdFlags)
 	cmds, rs, err := configure()
 	if err != nil {
