@@ -11,13 +11,16 @@ import (
 	"log"
 	"net/http"
 	"net/http/httputil"
+	"net/tls"
+	"net/url"
 	"os"
 	"os/exec"
 	"time"
 )
 
 const (
-	defaultInfluxURL = "http://USER:PASS@HOST:8086/write?db=MY_DB"
+	defaultInfluxURL  = "http://USER:PASS@HOST:8086/write?db=MY_DB"
+	templateInfluxURL = "http://localhost:8086/write?db=test"
 )
 
 var (
@@ -286,26 +289,71 @@ func (c cmds) run(rs *results) {
 	select {}
 }
 
+func influxEndpoint(rawurl, user, pass, host, dbname string) (string, error) {
+	if rawurl == "" {
+		rawurl = templateInfluxURL
+	}
+	u, err := url.Parse(rawurl)
+	if err != nil {
+		return "", fmt.Errorf("cannot parse influx endpoint URL: %v", err)
+	}
+	if host != "" {
+		u.Host = host
+	}
+	if dbname != "" {
+		q := u.Query()
+		q.Set("db", dbname)
+		u.RawQuery = q.Encode()
+	}
+	if user != "" {
+		if pass != "" {
+			u.User = url.UserPassword(user, pass)
+		} else {
+			u.User = url.User(user)
+		}
+	}
+	return u.String(), nil
+}
+
+func makeHttpClient(insecure bool) *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure},
+		},
+	}
+}
+
 func configure() (cmds, *results, error) {
 	verbose := flag.Bool("verbose", false, "Print measurements to stdout")
 	debug := flag.Bool("debug", false, "Print failed requests to stdout")
+	insecure := flag.Bool("insecure", false, "Ignore TLS validation")
+	ssl := flag.Bool("ssl", false, "Use TLS/SSL to connect to endpoint")
 	influxdb := flag.String("endpoint", defaultInfluxURL, "Address of InfluxDB write endpoint")
+	user := flag.String("user", "", "Username for authentication")
+	pass := flag.String("password", "", "Password for authentication")
+	host := flag.String("host", "", "Hostname of InfluxDB (overrides endpoint)")
+	dbname := flag.String("dbname", "", "Database name of InfluxDB (overrides endpoint)")
 	nbatch := flag.Int("nbatch", 100, "Max number of measurements to cache")
 	tbatch := flag.Duration("batch-time", 1*time.Minute, "Max duration betweek flushes of InfluxDB cache")
+	envprefix := flag.String("envs", "", "Prefix of environment variables to use (without trailing underscore)")
+
 	nworkers := 1 // number of HTTP submitting workers
 	nbuf := 0     // buffer for workers channel
 	flag.Parse()
+
+	endpoint, err := influxEndpoint(*influxdb, *user, *pass, *host, *dbname)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid influx endpoint configuration: %v", err)
+	}
 
 	cmds := cmdsFromArgs(flag.Args())
 	if len(cmds) == 0 {
 		return nil, nil, errors.New("specify one or more commands to execute, separated by semicolon")
 	}
-	client := &http.Client{}
-	submitter := newSubmitter(nworkers, nbuf, *influxdb, client, *debug)
+	client := makeHttpClient(insecure)
+	submitter := newSubmitter(nworkers, nbuf, endpoint, client, *debug)
 	var cs []collector
-	if *influxdb != "" && *influxdb != defaultInfluxURL {
-		cs = append(cs, newBatchCollector(*nbatch, *tbatch, submitter))
-	}
+	cs = append(cs, newBatchCollector(*nbatch, *tbatch, submitter))
 	if *verbose {
 		cs = append(cs, printCollector{os.Stdout})
 	}
