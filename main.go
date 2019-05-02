@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -34,6 +35,7 @@ type submitter struct {
 	ch       chan io.Reader
 	endpoint string
 	debug    bool
+	wg       sync.WaitGroup
 	client   *http.Client
 }
 
@@ -43,23 +45,31 @@ func newSubmitter(nworkers, nbuf int, endpoint string, client *http.Client, debu
 		client:   client,
 		endpoint: endpoint,
 		debug:    debug,
+		wg:       sync.WaitGroup{},
 	}
+	s.wg.Add(nworkers)
 	for i := 0; i < nworkers; i++ {
-		go s.run()
+		go s.run(&s.wg)
 	}
 	return s
 }
 
-func (s *submitter) run() {
+func (s *submitter) run(wg *sync.WaitGroup) {
 	for r := range s.ch {
 		if err := s.send(r); err != nil {
 			elog.Printf("could not submit batch: %v", err)
 		}
 	}
+	wg.Done()
 }
 
 func (s *submitter) submit(r io.Reader) {
 	s.ch <- r
+}
+
+func (s *submitter) close() {
+	close(s.ch)
+	s.wg.Wait()
 }
 
 func (s *submitter) send(r io.Reader) error {
@@ -120,11 +130,18 @@ func newBatchCollector(nbatch int, tbatch time.Duration, sub *submitter) *batchC
 }
 
 func (b *batchCollector) collect(ch <-chan string) {
-	var skipTick bool // avoid flushing because of full and then timeout
-	tick := time.Tick(b.tbatch)
+	var skipTick bool           // avoid flushing because of full and then timeout
+	tick := time.Tick(b.tbatch) // leaking this is ok because it's only once
 	for {
 		select {
-		case res := <-ch:
+		case res, ok := <-ch:
+			// channel closed, flush if there is data, then exit
+			if !ok {
+				if b.batchi > 0 {
+					b.flush()
+				}
+				return
+			}
 			if b.batchi >= b.nbatch {
 				b.flush()
 				skipTick = true
@@ -176,6 +193,7 @@ func (p printCollector) collect(ch <-chan string) {
 
 type results struct {
 	sinks []chan string
+	wg    sync.WaitGroup
 }
 
 func newResults(cols []collector) (*results, error) {
@@ -184,13 +202,22 @@ func newResults(cols []collector) (*results, error) {
 	}
 	r := &results{
 		sinks: make([]chan string, len(cols)),
+		wg:    sync.WaitGroup{},
 	}
+	r.wg.Add(len(cols))
 	for i := range cols {
 		ch := make(chan string)
 		r.sinks[i] = ch
-		go cols[i].collect(ch)
+		go func() {
+			cols[i].collect(ch)
+			r.wg.Done()
+		}()
 	}
 	return r, nil
+}
+
+func (r *results) wait() {
+	r.wg.Wait()
 }
 
 func (r *results) collect(ch <-chan string) {
@@ -287,7 +314,7 @@ func (c cmds) run(rs *results) {
 	for i := range c {
 		go runOne(&c[i])
 	}
-	select {}
+	rs.wait()
 }
 
 func influxEndpoint(rawurl, user, pass, host, dbname string, ssl bool) (string, error) {
@@ -341,7 +368,7 @@ func prefixEnv(prefix string, getenv func(string) string) func(*flag.Flag) {
 	}
 }
 
-func configure() (cmds, *results, error) {
+func configure() (cmds, *submitter, *results, error) {
 	verbose := flag.Bool("verbose", false, "Print measurements to stdout")
 	debug := flag.Bool("debug", false, "Print failed requests to stdout")
 	insecure := flag.Bool("insecure", false, "Ignore TLS validation")
@@ -362,12 +389,12 @@ func configure() (cmds, *results, error) {
 
 	endpoint, err := influxEndpoint(*influxdb, *user, *pass, *host, *dbname, *ssl)
 	if err != nil {
-		return nil, nil, fmt.Errorf("invalid influx endpoint configuration: %v", err)
+		return nil, nil, nil, fmt.Errorf("invalid influx endpoint configuration: %v", err)
 	}
 
 	cmds := cmdsFromArgs(flag.Args())
 	if len(cmds) == 0 {
-		return nil, nil, errors.New("specify one or more commands to execute, separated by semicolon")
+		return nil, nil, nil, errors.New("specify one or more commands to execute, separated by semicolon")
 	}
 	client := makeHttpClient(*insecure)
 	submitter := newSubmitter(nworkers, nbuf, endpoint, client, *debug)
@@ -378,18 +405,19 @@ func configure() (cmds, *results, error) {
 	}
 	rs, err := newResults(cs)
 	if err != nil {
-		return nil, nil, fmt.Errorf("%v: use either -endpoint or -verbose", err)
+		return nil, nil, nil, fmt.Errorf("%v: use either -endpoint or -verbose", err)
 	}
-	return cmdsFromArgs(flag.Args()), rs, nil
+	return cmdsFromArgs(flag.Args()), submitter, rs, nil
 }
 
 func main() {
 	elog = log.New(os.Stderr, "error - ", log.LstdFlags)
 	dlog = log.New(os.Stdout, "debug - ", log.LstdFlags)
 	flog = log.New(os.Stderr, "fatal - ", log.LstdFlags)
-	cmds, rs, err := configure()
+	cmds, submitter, rs, err := configure()
 	if err != nil {
 		flog.Fatalf("configuration error: %v", err)
 	}
 	cmds.run(rs)
+	submitter.close()
 }
