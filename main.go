@@ -305,10 +305,8 @@ func cmdsFromArgs(args []string) cmds {
 
 func (c cmds) run(rs *results) {
 	runOne := func(c *cmd) {
-		for {
-			if err := c.execCollect(rs); err != nil {
-				flog.Fatalf("executing subprocess: %v", err)
-			}
+		if err := c.execCollect(rs); err != nil {
+			flog.Fatalf("executing subprocess: %v", err)
 		}
 	}
 	for i := range c {
