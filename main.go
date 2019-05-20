@@ -268,7 +268,7 @@ func (c *cmd) execCollect(rs *results) error {
 
 type cmds []cmd
 
-func cmdsFromArgs(mkcmd func() cmd, args []string) cmds {
+func cmdsFromArgs(mkcmd func() cmd, nosplit bool, args []string) cmds {
 	cmds := cmds(make([]cmd, 0))
 	c := mkcmd()
 	for i := range args {
@@ -278,7 +278,9 @@ func cmdsFromArgs(mkcmd func() cmd, args []string) cmds {
 		}
 		if args[i] == ";" {
 			cmds = append(cmds, c)
-			c = mkcmd()
+			if !nosplit {
+				c = mkcmd()
+			}
 			continue
 		}
 		c.args = append(c.args, args[i])
@@ -358,6 +360,7 @@ func configure() (cmds, *results, error) {
 	verbose := flag.Bool("verbose", false, "Print measurements to stdout")
 	debug := flag.Bool("debug", false, "Print failed requests to stdout")
 	insecure := flag.Bool("insecure", false, "Ignore TLS validation")
+	nosplit := flag.Bool("nosplit", false, "Do not split the commands by semicolon")
 	ssl := flag.Bool("ssl", false, "Use TLS/SSL to connect to endpoint")
 	influxdb := flag.String("endpoint", defaultInfluxURL, "Address of InfluxDB write endpoint")
 	user := flag.String("user", "", "Username for authentication")
@@ -382,7 +385,7 @@ func configure() (cmds, *results, error) {
 	mkcmd := func() cmd {
 		return cmd{prefix: *prefix}
 	}
-	cmds := cmdsFromArgs(mkcmd, flag.Args())
+	cmds := cmdsFromArgs(mkcmd, *nosplit, flag.Args())
 	if len(cmds) == 0 {
 		return nil, nil, errors.New("specify one or more commands to execute, separated by semicolon")
 	}
