@@ -201,8 +201,20 @@ func (r *results) collect(ch <-chan string) {
 	}
 }
 
-func drainPipes(rs *results, stdout, stderr io.Reader) {
+func drainPipes(rs *results, prefix string, stdout, stderr io.Reader) {
 	ch := make(chan string)
+	send := func(line string) {
+		ch <- line
+	}
+	if prefix != "" {
+		send = func(line string) {
+			if strings.HasPrefix(line, prefix) {
+				ch <- strings.TrimSpace(line[len(prefix):])
+				return
+			}
+			fmt.Println(line)
+		}
+	}
 	go func() {
 		sc := bufio.NewScanner(stderr)
 		for sc.Scan() {
@@ -215,7 +227,7 @@ func drainPipes(rs *results, stdout, stderr io.Reader) {
 	go func() {
 		sc := bufio.NewScanner(stdout)
 		for sc.Scan() {
-			ch <- sc.Text()
+			send(sc.Text())
 		}
 		if err := sc.Err(); err != nil {
 			flog.Fatalf("fatal: reading stdout: %v", err)
@@ -226,8 +238,9 @@ func drainPipes(rs *results, stdout, stderr io.Reader) {
 }
 
 type cmd struct {
-	name string
-	args []string
+	name   string
+	prefix string
+	args   []string
 }
 
 func (c *cmd) execCollect(rs *results) error {
@@ -243,7 +256,7 @@ func (c *cmd) execCollect(rs *results) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("fatal: cannot start command: %v", err)
 	}
-	drainPipes(rs, stdout, stderr)
+	drainPipes(rs, c.prefix, stdout, stderr)
 	if err := cmd.Wait(); err != nil {
 		if _, ok := err.(*exec.ExitError); ok {
 			return fmt.Errorf("child exited with failure code, aborting (%v)", err)
@@ -255,9 +268,9 @@ func (c *cmd) execCollect(rs *results) error {
 
 type cmds []cmd
 
-func cmdsFromArgs(args []string) cmds {
+func cmdsFromArgs(mkcmd func() cmd, args []string) cmds {
 	cmds := cmds(make([]cmd, 0))
-	c := cmd{}
+	c := mkcmd()
 	for i := range args {
 		if c.name == "" {
 			c.name = args[i]
@@ -265,7 +278,7 @@ func cmdsFromArgs(args []string) cmds {
 		}
 		if args[i] == ";" {
 			cmds = append(cmds, c)
-			c = cmd{}
+			c = mkcmd()
 			continue
 		}
 		c.args = append(c.args, args[i])
@@ -351,6 +364,7 @@ func configure() (cmds, *results, error) {
 	pass := flag.String("password", "", "Password for authentication")
 	host := flag.String("host", "", "Hostname of InfluxDB (overrides endpoint)")
 	dbname := flag.String("dbname", "", "Database name of InfluxDB (overrides endpoint)")
+	prefix := flag.String("prefix", "", "Only parse lines with this prefix, write back everything else")
 	nbatch := flag.Int("nbatch", 100, "Max number of measurements to cache")
 	tbatch := flag.Duration("batch-time", 1*time.Minute, "Max duration betweek flushes of InfluxDB cache")
 
@@ -365,7 +379,10 @@ func configure() (cmds, *results, error) {
 		return nil, nil, fmt.Errorf("invalid influx endpoint configuration: %v", err)
 	}
 
-	cmds := cmdsFromArgs(flag.Args())
+	mkcmd := func() cmd {
+		return cmd{prefix: *prefix}
+	}
+	cmds := cmdsFromArgs(mkcmd, flag.Args())
 	if len(cmds) == 0 {
 		return nil, nil, errors.New("specify one or more commands to execute, separated by semicolon")
 	}
@@ -380,7 +397,7 @@ func configure() (cmds, *results, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("%v: use either -endpoint or -verbose", err)
 	}
-	return cmdsFromArgs(flag.Args()), rs, nil
+	return cmds, rs, nil
 }
 
 func main() {
