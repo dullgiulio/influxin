@@ -218,7 +218,7 @@ func drainPipes(rs *results, prefix string, stdout, stderr io.Reader) {
 	go func() {
 		sc := bufio.NewScanner(stderr)
 		for sc.Scan() {
-			fmt.Println(sc.Text())
+			fmt.Fprintf(os.Stderr, "%s\n", sc.Text())
 		}
 		if err := sc.Err(); err != nil {
 			elog.Printf("reading stderr: %v", err)
@@ -243,7 +243,8 @@ type cmd struct {
 	args   []string
 }
 
-func (c *cmd) execCollect(rs *results) error {
+func (c *cmd) execCollect(rs *results, id int) error {
+	dlog.Printf("executing #%d: %s %v", id, c.name, c.args)
 	cmd := exec.Command(c.name, c.args...)
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
@@ -277,11 +278,11 @@ func cmdsFromArgs(mkcmd func() cmd, nosplit bool, args []string) cmds {
 			continue
 		}
 		if args[i] == ";" {
-			cmds = append(cmds, c)
 			if !nosplit {
+				cmds = append(cmds, c)
 				c = mkcmd()
+				continue
 			}
-			continue
 		}
 		c.args = append(c.args, args[i])
 	}
@@ -292,15 +293,15 @@ func cmdsFromArgs(mkcmd func() cmd, nosplit bool, args []string) cmds {
 }
 
 func (c cmds) run(rs *results) {
-	runOne := func(c *cmd) {
+	runOne := func(c *cmd, id int) {
 		for {
-			if err := c.execCollect(rs); err != nil {
-				flog.Fatalf("executing subprocess: %v", err)
+			if err := c.execCollect(rs, id); err != nil {
+				flog.Fatalf("executing subprocess #%d: %v", id, err)
 			}
 		}
 	}
 	for i := range c {
-		go runOne(&c[i])
+		go runOne(&c[i], i)
 	}
 	select {}
 }
@@ -356,13 +357,13 @@ func prefixEnv(prefix string, getenv func(string) string) func(*flag.Flag) {
 	}
 }
 
-func configure() (cmds, *results, error) {
+func start() error {
 	verbose := flag.Bool("verbose", false, "Print measurements to stdout")
 	debug := flag.Bool("debug", false, "Print failed requests to stdout")
 	insecure := flag.Bool("insecure", false, "Ignore TLS validation")
 	nosplit := flag.Bool("nosplit", false, "Do not split the commands by semicolon")
 	ssl := flag.Bool("ssl", false, "Use TLS/SSL to connect to endpoint")
-	influxdb := flag.String("endpoint", defaultInfluxURL, "Address of InfluxDB write endpoint")
+	influxdb := flag.String("endpoint", defaultInfluxURL, "Address of InfluxDB write endpoint; if not specified defaults to verbose mode")
 	user := flag.String("user", "", "Username for authentication")
 	pass := flag.String("password", "", "Password for authentication")
 	host := flag.String("host", "", "Hostname of InfluxDB (overrides endpoint)")
@@ -377,9 +378,23 @@ func configure() (cmds, *results, error) {
 	nworkers := 1 // number of HTTP submitting workers
 	nbuf := 0     // buffer for workers channel
 
-	endpoint, err := influxEndpoint(*influxdb, *user, *pass, *host, *dbname, *ssl)
-	if err != nil {
-		return nil, nil, fmt.Errorf("invalid influx endpoint configuration: %v", err)
+	dlog = log.New(ioutil.Discard, "", 0)
+	if *debug {
+		dlog = log.New(os.Stdout, "debug - ", log.LstdFlags)
+	}
+
+	var (
+		endpoint string
+		err      error
+	)
+	if *influxdb != defaultInfluxURL {
+		endpoint, err = influxEndpoint(*influxdb, *user, *pass, *host, *dbname, *ssl)
+		if err != nil {
+			return fmt.Errorf("invalid influx endpoint configuration: %v", err)
+		}
+	} else {
+		// without an endpoint, default to verbose
+		*verbose = true
 	}
 
 	mkcmd := func() cmd {
@@ -387,29 +402,29 @@ func configure() (cmds, *results, error) {
 	}
 	cmds := cmdsFromArgs(mkcmd, *nosplit, flag.Args())
 	if len(cmds) == 0 {
-		return nil, nil, errors.New("specify one or more commands to execute, separated by semicolon")
+		return errors.New("specify one or more commands to execute, separated by semicolon")
 	}
-	client := makeHttpClient(*insecure)
-	submitter := newSubmitter(nworkers, nbuf, endpoint, client, *debug)
 	var cs []collector
-	cs = append(cs, newBatchCollector(*nbatch, *tbatch, submitter))
+	if endpoint != "" {
+		client := makeHttpClient(*insecure)
+		submitter := newSubmitter(nworkers, nbuf, endpoint, client, *debug)
+		cs = append(cs, newBatchCollector(*nbatch, *tbatch, submitter))
+	}
 	if *verbose {
 		cs = append(cs, printCollector{os.Stdout})
 	}
 	rs, err := newResults(cs)
 	if err != nil {
-		return nil, nil, fmt.Errorf("%v: use either -endpoint or -verbose", err)
+		return fmt.Errorf("%v: use either -endpoint or -verbose", err)
 	}
-	return cmds, rs, nil
+	cmds.run(rs)
+	return nil
 }
 
 func main() {
 	elog = log.New(os.Stderr, "error - ", log.LstdFlags)
-	dlog = log.New(os.Stdout, "debug - ", log.LstdFlags)
 	flog = log.New(os.Stderr, "fatal - ", log.LstdFlags)
-	cmds, rs, err := configure()
-	if err != nil {
+	if err := start(); err != nil {
 		flog.Fatalf("configuration error: %v", err)
 	}
-	cmds.run(rs)
 }
