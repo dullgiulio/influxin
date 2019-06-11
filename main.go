@@ -300,6 +300,10 @@ func (c cmds) run(rs *results) {
 			}
 		}
 	}
+	if len(c) == 1 {
+		runOne(&c[0], 0)
+		return
+	}
 	for i := range c {
 		go runOne(&c[i], i)
 	}
