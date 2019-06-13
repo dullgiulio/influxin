@@ -230,7 +230,7 @@ func drainPipes(rs *results, prefix string, stdout, stderr io.Reader) {
 			send(sc.Text())
 		}
 		if err := sc.Err(); err != nil {
-			flog.Fatalf("fatal: reading stdout: %v", err)
+			elog.Printf("fatal: reading stdout: %v", err)
 		}
 		close(ch)
 	}()
@@ -292,11 +292,14 @@ func cmdsFromArgs(mkcmd func() cmd, nosplit bool, args []string) cmds {
 	return cmds
 }
 
-func (c cmds) run(rs *results) {
+func (c cmds) run(rs *results, fatal bool) {
 	runOne := func(c *cmd, id int) {
 		for {
 			if err := c.execCollect(rs, id); err != nil {
-				flog.Fatalf("executing subprocess #%d: %v", id, err)
+				elog.Printf("executing subprocess #%d: %v", id, err)
+				if fatal {
+					elog.Fatalf("terminating all on subprocess failure")
+				}
 			}
 		}
 	}
@@ -375,6 +378,7 @@ func start() error {
 	prefix := flag.String("prefix", "", "Only parse lines with this prefix, write back everything else")
 	nbatch := flag.Int("nbatch", 100, "Max number of measurements to cache")
 	tbatch := flag.Duration("batch-time", 1*time.Minute, "Max duration betweek flushes of InfluxDB cache")
+	fatal := flag.Bool("fatal", false, "Subprocess errors are fatal errors")
 
 	flag.VisitAll(prefixEnv("INFLUXIN", os.Getenv))
 	flag.Parse()
@@ -421,7 +425,7 @@ func start() error {
 	if err != nil {
 		return fmt.Errorf("%v: use either -endpoint or -verbose", err)
 	}
-	cmds.run(rs)
+	cmds.run(rs, *fatal)
 	return nil
 }
 
